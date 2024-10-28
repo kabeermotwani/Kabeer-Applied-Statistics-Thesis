@@ -1,0 +1,2028 @@
+---
+title: "Microarray CNV 787"
+format: html
+editor: visual
+---
+
+Load libraries, data, log2 transform, Expression Value Distribution Plot, Mean-Variance Trend, UMAP Plot
+
+```{r}
+# Version info: R 4.2.2, Biobase 2.58.0, GEOquery 2.66.0, limma 3.54.0
+################################################################
+#   Data plots for selected GEO samples
+library(GEOquery)
+library(limma)
+library(umap)
+library(cluster)
+library(ggplot2)
+library(pheatmap)
+library(plotly)
+library(maptools)
+library(DNAcopy)
+library(purrr)
+
+# load series and platform data from GEO
+gset <- getGEO("GSE31259", GSEMatrix =TRUE, getGPL=FALSE)
+if (length(gset) > 1) idx <- grep("GPL6947", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+ex <- exprs(gset)
+
+
+# box-and-whisker plot
+par(mar = c(7, 4, 2, 1))
+title <- paste("GSE31259", "/", annotation(gset), sep = "")
+boxplot(ex, boxwex = 0.7, notch = TRUE, main = title, outline = FALSE, las = 2)
+
+
+# expression value distribution plot
+par(mar=c(4,4,2,1))
+title <- paste ("GSE31259", "/", annotation(gset), " value distribution", sep ="")
+plotDensities(ex, main=title, legend=F)
+
+# mean-variance trend
+ex <- na.omit(ex) # eliminate rows with NAs
+plotSA(lmFit(ex), main="Mean variance trend, GSE31259")
+
+# UMAP plot (multi-dimensional scaling)
+ex <- ex[!duplicated(ex), ]  # remove duplicates
+ump <- umap(t(ex), n_neighbors = 15, random_state = 123)
+plot(ump$layout, main="UMAP plot, nbrs=15", xlab="", ylab="", pch=20, cex=1.5)
+library("maptools")  # point labels without overlaps
+pointLabel(ump$layout, labels = rownames(ump$layout), method="SANN", cex=0.6)
+```
+
+UMAP plot shows three potential clusters
+
+```{r}
+#| echo: false
+
+# Function to compute total within-cluster sum of squares
+wss <- function(k) {
+  kmeans(t(ex), k, nstart=10)$tot.withinss
+}
+
+# Compute and plot the within-cluster sum of squares for different values of k
+k.values <- 1:10
+wss_values <- map_dbl(k.values, wss)
+
+plot(k.values, wss_values,
+     type="b", pch=19, frame=FALSE,
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+
+# Perform hierarchical clustering
+d <- dist(t(ex))
+hc <- hclust(d, method="ward.D2")
+
+# Plot the dendrogram
+plot(hc, cex=0.6, hang=-1)
+rect.hclust(hc, k=3, border="red")
+
+
+
+
+
+library(cluster)
+
+# Function to compute average silhouette width for k clusters
+silhouette_score <- function(k) {
+  km <- kmeans(t(ex), centers=k, nstart=25)
+  ss <- silhouette(km$cluster, dist(t(ex)))
+  mean(ss[, 3])
+}
+
+# Compute silhouette scores for different k
+k.values <- 2:10
+avg_sil <- sapply(k.values, silhouette_score)
+
+# Plot the silhouette scores
+plot(k.values, avg_sil, type="b", pch=19, frame=FALSE, xlab="Number of clusters K", ylab="Average Silhouette Score")
+
+# Create k-means result outside the function
+set.seed(123)
+kmeans_result <- kmeans(t(ex), centers = 3, nstart = 25)
+
+
+```
+
+Three clusters look fairly okay from the dendrogram but the average silhouette score shows 2 has the highest score but there is a drop off to three. the score increases for 6 and 9 so these are also potential amounts of clusters to use. The dendrogram and elbow suggest three, silhouette suggests 2, 6, or 9 so I will run k-means clustering for all options.
+
+```{r}
+
+library(ggplot2)
+library(cluster)
+# Function to plot UMAP with k-means clusters
+plot_kmeans <- function(k) {
+  set.seed(123)
+  kmeans_result <- kmeans(t(ex), centers = k, nstart = 25)
+  ump$layout <- as.data.frame(ump$layout)
+  ump$layout$cluster <- as.factor(kmeans_result$cluster)
+  
+  p <- ggplot(ump$layout, aes(x = V1, y = V2, color = cluster)) +
+    geom_point(size = 2) +
+    labs(title = paste("UMAP plot with k-means clustering (k = ", k, ")", sep = ""), x = "", y = "") +
+    theme_minimal() +
+    theme(legend.position = "right")
+  plot(p)
+}
+
+# Plot for k = 2, 3, 6, 9
+plot_kmeans(2)
+plot_kmeans(3)
+plot_kmeans(6)
+plot_kmeans(9)
+
+# Extract the cluster assignments
+cluster_assignments <- data.frame(Sample = rownames(t(ex)), Cluster = kmeans_result$cluster)
+
+# View cluster assignments
+print(cluster_assignments)
+```
+
+The UMAP with three clusters is the one that looks the best with real seperate groups. Next I want to show the cluster assignments so that I can do cluster v cluster comparisions (WILL CONDUCT WITH GEO2R LATER.
+
+Next I want to look at the cluster summary.
+
+```{r}
+# Ensure the row names of the expression data match the sample names 
+rownames(cluster_assignments) <- cluster_assignments$Sample
+
+# Aggregate the expression data by cluster
+exprs_transposed <- t(ex)
+
+# Add cluster assignments to the expression data
+exprs_transposed <- as.data.frame(exprs_transposed)
+exprs_transposed$Cluster <- cluster_assignments$Cluster[match(rownames(exprs_transposed), cluster_assignments$Sample)]
+
+# Compute summary statistics (mean) for each cluster
+cluster_summary <- aggregate(. ~ Cluster, data = exprs_transposed, FUN = mean)
+
+
+
+```
+
+Now I want to conduct differential expression analysis between clusters.
+
+```{r}
+# Version info: R 4.2.2, Biobase 2.58.0, GEOquery 2.66.0, limma 3.54.0
+################################################################
+#   Differential expression analysis with limma
+library(GEOquery)
+library(limma)
+library(umap)
+
+# load series and platform data from GEO
+
+gset <- getGEO("GSE31259", GSEMatrix =TRUE, AnnotGPL=TRUE)
+if (length(gset) > 1) idx <- grep("GPL6947", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# make proper column names to match toptable 
+fvarLabels(gset) <- make.names(fvarLabels(gset))
+
+# group membership for all samples
+gsms <- paste0("22220202212200021002222020011122211002112102012112",
+        "222110012120221020121121")
+sml <- strsplit(gsms, split="")[[1]]
+
+# assign samples to groups and set up design matrix
+gs <- factor(sml)
+groups <- make.names(c("cluster1","cluster2","cluster3"))
+levels(gs) <- groups
+gset$group <- gs
+design <- model.matrix(~group + 0, gset)
+colnames(design) <- levels(gs)
+
+gset <- gset[complete.cases(exprs(gset)), ] # skip missing values
+
+fit <- lmFit(gset, design)  # fit linear model
+
+# set up contrasts of interest and recalculate model coefficients
+cts <- c(paste(groups[1],"-",groups[2],sep=""), paste(groups[1],"-",groups[3],sep=""), paste(groups[2],"-",groups[3],sep=""))
+cont.matrix <- makeContrasts(contrasts=cts, levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+
+# compute statistics and table of top significant genes
+fit2 <- eBayes(fit2, 0.01)
+tT <- topTable(fit2, adjust="fdr", sort.by="B", number=250)
+
+tT <- subset(tT, select=c("ID","adj.P.Val","P.Value","F","GI","Chromosome.location","Gene.symbol","Gene.title"))
+write.table(tT, file=stdout(), row.names=F, sep="\t")
+
+# Visualize and quality control test results.
+# Build histogram of P-values for all genes. Normal test
+# assumption is that most genes are not differentially expressed.
+tT2 <- topTable(fit2, adjust="fdr", sort.by="B", number=Inf)
+hist(tT2$adj.P.Val, col = "grey", border = "white", xlab = "P-adj",
+  ylab = "Number of genes", main = "P-adj value distribution")
+
+# summarize test results as "up", "down" or "not expressed"
+dT <- decideTests(fit2, adjust.method="fdr", p.value=0.05, lfc=0)
+
+# Venn diagram of results
+vennDiagram(dT, circle.col=palette())
+
+# create Q-Q plot for t-statistic
+t.good <- which(!is.na(fit2$F)) # filter out bad probes
+qqt(fit2$t[t.good], fit2$df.total[t.good], main="Moderated t statistic")
+
+# volcano plot (log P-value vs log fold change)
+colnames(fit2) # list contrast names
+ct <- 1        # choose contrast of interest
+
+ 
+# The following will produce basic volcano plot using limma function:
+volcanoplot(fit2, coef=ct, main=colnames(fit2)[ct], pch=20,
+  highlight=length(which(dT[,ct]!=0)), names=rep('+', nrow(fit2)))
+
+# MD plot (log fold change vs mean log expression)
+# highlight statistically significant (p-adj < 0.05) probes
+plotMD(fit2, column=ct, status=dT[,ct], legend=F, pch=20, cex=1)
+abline(h=0)
+
+################################################################
+# General expression data analysis
+ex <- exprs(gset)
+
+# box-and-whisker plot
+dev.new(width=3+ncol(gset)/6, height=5)
+ord <- order(gs)  # order samples by group
+palette(c("#1B9E77", "#7570B3", "#E7298A", "#E6AB02", "#D95F02",
+          "#66A61E", "#A6761D", "#B32424", "#B324B3", "#666666"))
+par(mar=c(7,4,2,1))
+title <- paste ("GSE31259", "/", annotation(gset), sep ="")
+boxplot(ex[,ord], boxwex=0.6, notch=T, main=title, outline=FALSE, las=2, col=gs[ord])
+legend("topleft", groups, fill=palette(), bty="n")
+dev.off()
+
+# expression value distribution
+par(mar=c(4,4,2,1))
+title <- paste ("GSE31259", "/", annotation(gset), " value distribution", sep ="")
+plotDensities(ex, group=gs, main=title, legend ="topright")
+
+# UMAP plot (dimensionality reduction)
+ex <- na.omit(ex) # eliminate rows with NAs
+ex <- ex[!duplicated(ex), ]  # remove duplicates
+ump <- umap(t(ex), n_neighbors = 15, random_state = 123)
+par(mar=c(3,3,2,6), xpd=TRUE)
+plot(ump$layout, main="UMAP plot, nbrs=15", xlab="", ylab="", col=gs, pch=20, cex=1.5)
+legend("topright", inset=c(-0.15,0), legend=levels(gs), pch=20,
+col=1:nlevels(gs), title="Group", pt.cex=1.5)
+library("maptools")  # point labels without overlaps
+pointLabel(ump$layout, labels = rownames(ump$layout), method="SANN", cex=0.6)
+
+# mean-variance trend, helps to see if precision weights are needed
+plotSA(fit2, main="Mean variance trend, GSE31259")
+
+
+```
+
+Now conducting a PCA.
+
+```{r}
+
+# Load necessary libraries
+library(ggplot2)
+
+# Perform PCA on the transposed expression data
+pca_result <- prcomp(t(ex), scale. = TRUE)
+
+# Create a data frame with PCA results and cluster assignments
+pca_data <- as.data.frame(pca_result$x)
+pca_data$Cluster <- factor(cluster_assignments$Cluster)
+pca_data$Sample <- rownames(pca_data)
+
+# Plot the first two principal components
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Cluster, label = Sample)) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(title = "PCA Plot of Expression Data", x = "Principal Component 1", y = "Principal Component 2") +
+  theme(legend.position = "right") +
+  geom_text(size = 2, vjust = 1.5)
+
+# Create a scree plot
+variance_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+scree_data <- data.frame(PC = 1:length(variance_explained), Variance = variance_explained)
+
+ggplot(scree_data, aes(x = PC, y = Variance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Scree Plot", x = "Principal Component", y = "Proportion of Variance Explained")
+
+library(plotly)
+
+# Create a 3D scatter plot of the first three principal components
+plot_ly(pca_data, x = ~PC1, y = ~PC2, z = ~PC3, color = ~Cluster, text = ~Sample, type = 'scatter3d', mode = 'markers') %>%
+  layout(title = "3D PCA Plot of Expression Data",
+         scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC2'),
+                      zaxis = list(title = 'PC3')))
+
+# Number of principal components to retain
+num_pcs <- 10  # Choosen based on the elbow point
+
+# Perform PCA
+pca_result <- prcomp(t(ex), scale. = TRUE)
+
+# Create a data frame with the first few principal components
+pca_data <- as.data.frame(pca_result$x[, 1:num_pcs])
+pca_data$Cluster <- factor(cluster_assignments$Cluster)
+pca_data$Sample <- rownames(pca_data)
+
+# Plot the first two principal components
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Cluster, label = Sample)) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(title = "PCA Plot of Expression Data", x = "Principal Component 1", y = "Principal Component 2") +
+  theme(legend.position = "right") +
+  geom_text(size = 2, vjust = 1.5)
+```
+
+The scree plot shows that PC1 accounts for about 5% of variation, each one after is less. There seems to be an elbow somewhere between the 5th and 10th PC. That is why I used the top ten PC's to visualize to see if there are any clusters (reducing dimensionality but retaining variability).
+
+```{r}
+# Load necessary libraries
+library(GEOquery)
+library(zoo)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+
+# Ensure row names are set to probe IDs
+ex <- exprs(gset)
+if (is.null(rownames(ex))) {
+  rownames(ex) <- featureNames(gset)
+}
+
+# Verify the row names
+head("Row names of the expression data (first 10):")
+head(head(rownames(ex), 10))
+
+# Load necessary library
+library(GEOquery)
+
+# Download the platform annotation file
+gpl <- getGEO("GPL6947", destdir = ".")
+gpl_data <- Table(gpl)
+
+# Verify the IDs in the platform annotation
+head("IDs in platform annotation (first 10):")
+head(head(gpl_data$ID, 10))
+
+# Extract chromosome and map location information
+chromosome <- gpl_data$Chromosome
+maploc_raw <- gpl_data$Probe_Coordinates
+
+# Parse map location from Probe_Coordinates
+maploc <- as.numeric(sub("-.*", "", maploc_raw))
+
+# Ensure the data matches the features in your expression data
+matching_indices <- match(rownames(ex), gpl_data$ID)
+
+# Check the matching indices to ensure proper matching
+head("Matching indices (first 10):")
+head(head(matching_indices, 10))
+
+# Filter based on matching indices
+chromosome <- chromosome[matching_indices]
+maploc <- maploc[matching_indices]
+
+# head lengths after matching
+head("Length of chromosome after matching:")
+head(length(chromosome))
+head("Length of maploc after matching:")
+head(length(maploc))
+
+# Convert to numeric and handle NA values
+chromosome <- as.numeric(as.character(chromosome))
+maploc <- as.numeric(as.character(maploc))
+
+# head after conversion
+head("Chromosome (first 10) after conversion:")
+head(head(chromosome, 10))
+head("Maploc (first 10) after conversion:")
+head(head(maploc, 10))
+
+# Check for any NA values 
+valid_rows <- complete.cases(chromosome, maploc)
+chromosome <- chromosome[valid_rows]
+maploc <- maploc[valid_rows]
+ex <- ex[valid_rows, ]
+
+# Verify dimensions
+head("Dimensions of expression data after filtering:")
+head(dim(ex))
+head("Length of chromosome after filtering:")
+head(length(chromosome))
+head("Length of maploc after filtering:")
+head(length(maploc))
+
+# Verify data
+head("First few rows of the final data frame:")
+head(head(data.frame(Chromosome = chromosome, Maploc = maploc, Expression = ex[1:29987, ])))
+
+library(zoo) 
+
+# Calculate rolling means to smooth the expression data
+roll_mean_expr <- t(apply(ex, 1, function(x) rollapply(x, width=5, FUN=mean, align='center', na.rm=TRUE)))
+
+# Recalculate Z-scores for each gene (row-wise Z-score calculation)
+z_scores <- t(apply(roll_mean_expr, 1, function(x) {
+  z <- (x - mean(x, na.rm=TRUE)) / sd(x, na.rm=TRUE)
+  z[is.na(z)] <- 0  
+  return(z)
+}))
+
+
+# Identify potential CNVs by thresholding the Z-scores
+cnv_gain <- z_scores > 2.9
+cnv_loss <- z_scores < -2.9
+
+# Ensure that the CNV matrices have been correctly calculated
+head("Summary of CNV gains:")
+head(summary(cnv_gain))
+head("Summary of CNV losses:")
+head(summary(cnv_loss))
+
+
+# Step 4: Prepare data for plotting
+plot_data <- data.frame(
+  Position = maploc,
+  Z_score = z_scores[, 2],  #using the first sample as an example
+  Chromosome = chromosome
+)
+
+# Plot CNV patterns
+library(ggplot2)
+ggplot(plot_data) +
+  geom_point(aes(x = Position, y = Z_score, color = as.factor(Chromosome))) +
+  labs(title = "CNV Inference from Microarray Data", x = "Genomic Position", y = "Z-score") +
+  theme_minimal() +
+  scale_color_discrete(name = "Chromosome")
+
+# Summary of identified CNVs
+# Count the number of gains and losses
+num_gains <- sum(cnv_gain, na.rm=TRUE)
+num_losses <- sum(cnv_loss, na.rm=TRUE)
+
+cat("Number of potential CNV gains identified:", num_gains, "\n")
+cat("Number of potential CNV losses identified:", num_losses, "\n")
+# Summarize the number of CNVs per chromosome
+cnv_summary <- data.frame(
+  Chromosome = factor(chromosome, levels = unique(chromosome)),
+  Gains = rowSums(cnv_gain, na.rm=TRUE),
+  Losses = -rowSums(cnv_loss, na.rm=TRUE)  # Make losses negative for visualization
+)
+
+# Check the summarized data
+head("CNV Summary:")
+head(head(cnv_summary))
+
+# Plot gains and losses by chromosome
+ggplot(cnv_summary, aes(x = Chromosome)) +
+  geom_bar(aes(y = Gains), stat = "identity", fill = "blue", alpha = 0.6) +
+  geom_bar(aes(y = Losses), stat = "identity", fill = "red", alpha = 0.6) +
+  labs(title = "CNV Gains and Losses by Chromosome", x = "Chromosome", y = "Number of CNVs") +
+  theme_minimal() +
+  scale_y_continuous(labels = abs)  # Ensure the Y-axis labels are positive
+
+
+
+
+
+
+```
+
+```{r}
+# Initialize a list to store CNV summaries for each sample
+cnv_summary_list <- list()
+
+# Loop through each sample to calculate rolling means and CNVs
+for (sample_id in colnames(ex)) {
+    # Extract the expression values for the current sample
+    sample_expr <- ex[, sample_id]
+    
+    # Calculate the rolling mean for the sample
+    roll_mean_expr <- rollapply(sample_expr, width=5, FUN=mean, align='center', na.rm=TRUE, fill=NA)
+    
+    # Calculate Z-scores for the sample
+    z_scores <- (roll_mean_expr - mean(roll_mean_expr, na.rm=TRUE)) / sd(roll_mean_expr, na.rm=TRUE)
+    z_scores[is.na(z_scores)] <- 0 
+    
+    # Identify CNVs
+    cnv_gain <- z_scores > 3
+    cnv_loss <- z_scores < -3
+    
+    # Summarize CNVs by chromosome for the current sample
+    cnv_summary <- data.frame(
+        Chromosome = factor(chromosome, levels = unique(chromosome)),
+        Gains = rowSums(matrix(cnv_gain, ncol = 1), na.rm=TRUE),
+        Losses = -rowSums(matrix(cnv_loss, ncol = 1), na.rm=TRUE)
+    )
+    
+    # Store in the list
+    cnv_summary_list[[sample_id]] <- cnv_summary
+}
+
+head(cnv_summary_list[[1]])
+
+
+# Load necessary library
+library(ggplot2)
+
+# Function to plot CNV changes for a single sample
+plot_cnv_changes <- function(cnv_summary, sample_id) {
+  cnv_summary_long <- cnv_summary %>%
+    gather(key = "Type", value = "Count", Gains, Losses)
+    p <- ggplot(cnv_summary_long, aes(x = Chromosome, y = Count, fill = Type)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(title = paste("CNV Gains and Losses for Sample", sample_id),
+         x = "Chromosome", y = "Number of CNVs") +
+    theme_minimal() +
+    scale_fill_manual(values = c("blue", "red"), labels = c("Gains", "Losses"))
+  
+  return(p)
+}
+# Loop through all samples and plot their CNV changes
+for (i in seq_along(cnv_summary_list)) {
+  cnv_summary <- cnv_summary_list[[i]]
+  sample_id <- names(cnv_summary_list)[i]
+  
+  plot <- plot_cnv_changes(cnv_summary, sample_id)
+  
+  # Save the plot as a file or head it
+  print(plot)
+  
+}
+
+```
+
+```{r}
+# Step 2: Add chromosome arm information based on map location
+# Adjust the centromere threshold as appropriate for your data
+df <- data.frame(
+  Chromosome = chromosome,
+  Maploc = maploc,
+  Expression = ex[, 1]  # Just using the first sample as an example
+)
+
+# Define centromere thresholds for each chromosome (example values, adjust as needed)
+# Centromere positions for GRCh38/hg38
+centromere_positions <- c(
+  "1" = 123400000, "2" = 93900000, "3" = 91800000, "4" = 50700000, "5" = 48800000,
+  "6" = 59800000, "7" = 60100000, "8" = 45400000, "9" = 49000000, "10" = 39800000,
+  "11" = 53400000, "12" = 35500000, "13" = 17700000, "14" = 17200000, "15" = 19000000,
+  "16" = 36800000, "17" = 25100000, "18" = 18500000, "19" = 26200000, "20" = 28100000,
+  "21" = 12000000, "22" = 15000000
+)
+
+
+
+# Add a new column to indicate the arm
+df$Arm <- ifelse(df$Maploc < centromere_positions[as.character(df$Chromosome)], "p", "q")
+
+# Step 3: Calculate statistics for each chromosome arm
+arm_summary <- df %>%
+  group_by(Chromosome, Arm) %>%
+  summarize(AverageSignal = mean(Expression, na.rm=TRUE))
+
+# Perform t-tests comparing p and q arms within each chromosome
+library(broom)
+test_results <- df %>%
+  group_by(Chromosome) %>%
+  do(tidy(t.test(Expression ~ Arm, data = .)))
+
+# View the summary results
+head(arm_summary)
+head(test_results)
+
+# Visualize the data
+ggplot(arm_summary, aes(x = Arm, y = AverageSignal, fill = Arm)) +
+  geom_boxplot() +
+  facet_wrap(~ Chromosome, scales = "free") +
+  theme_minimal() +
+  labs(title = "Average Signal by Chromosome Arm", x = "Arm", y = "Average Signal")
+
+```
+
+```{r}
+
+# Load the package
+library(cBioPortalData)
+
+# Initialize the cBioPortal API client
+cbio <- cBioPortal()
+## Use ask=FALSE for non-interactive use
+metabric <- cBioDataPack("brca_metabric", ask = FALSE)
+metabric
+```
+
+```{r}
+# Load a tab-delimited file
+CNA_Genes.IS8 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS8.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS9 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS9.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS10 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS10.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS1 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS1.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS2 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS2.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS3 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS3.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS4 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS4.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS5 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS5.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS6 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS6.txt", header = TRUE, stringsAsFactors = FALSE)
+
+CNA_Genes.IS7 <- read.delim("/Users/kabeermotwani/Library/Mobile Documents/com~apple~CloudDocs/St Andrews Thesis/Thesis/CNA_Genes-IS7.txt", header = TRUE, stringsAsFactors = FALSE)
+
+
+# Convert Freq column to numeric, removing any non-numeric characters if necessary
+CNA_Genes.IS8$Freq <- as.numeric(gsub("[^0-9.]", "", CNA_Genes.IS8$Freq))
+
+
+# Calculate the weighted frequency of amplifications and deletions by chromosomal region
+cna_summary_ic8 <- CNA_Genes.IS8 %>%
+  group_by(Cytoband) %>%
+  summarise(
+    Weighted_Amplifications = sum(Freq[CNA == "AMP"]),
+    Weighted_Deletions = sum(Freq[CNA == "HOMDEL"])
+  )
+
+# View the summarized reference profile for IC8
+head(cna_summary_ic8)
+
+```
+
+```{r}
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS8$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS8$Cytoband)
+
+# Step 2: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS8$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS8$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic8 <- CNA_Genes.IS8 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic8 <- cna_summary_ic8 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic8 <- cna_summary_ic8 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic8)
+
+```
+
+```{r}
+# Function to calculate similarity score between a sample's CNV profile and the IC8 profile
+calculate_similarity <- function(sample_cnv, ic8_profile) {
+  # Merge the sample CNV data with the IC8 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic8_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC8
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic8)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC8", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC8 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+
+# Assuming 'CNA_Genes.IS9' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS9$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS9$Cytoband)
+
+# Step 2: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS9$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS9$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic9 <- CNA_Genes.IS9 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic9 <- cna_summary_ic9 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic9 <- cna_summary_ic9 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic9)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC9 profile
+calculate_similarity <- function(sample_cnv, ic9_profile) {
+  # Merge the sample CNV data with the IC9 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic9_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC9
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic9)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC9", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC9 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS10' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS10$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS10$Cytoband)
+
+# Step 2: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS10$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS10$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic10 <- CNA_Genes.IS10 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic10 <- cna_summary_ic10 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic10 <- cna_summary_ic10 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic10)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC10 profile
+calculate_similarity <- function(sample_cnv, ic10_profile) {
+  # Merge the sample CNV data with the IC10 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic10_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC10
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic10)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC10", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC10 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS1' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS1$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS1$Cytoband)
+
+# Step 2: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS1$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS1$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic1 <- CNA_Genes.IS1 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic1 <- cna_summary_ic1 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic1 <- cna_summary_ic1 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic1)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC1 profile
+calculate_similarity <- function(sample_cnv, ic1_profile) {
+  # Merge the sample CNV data with the IC1 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic1_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC1
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic1)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC1", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC1 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS2' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS2$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS2$Cytoband)
+
+# Step 2: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS2$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS2$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic2 <- CNA_Genes.IS2 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic2 <- cna_summary_ic2 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic2 <- cna_summary_ic2 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic2)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC2 profile
+calculate_similarity <- function(sample_cnv, ic2_profile) {
+  # Merge the sample CNV data with the IC2 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic2_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC2
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic2)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC2", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC2 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS3' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS3$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS3$Cytoband)
+
+# Step 3: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS3$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS3$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic3 <- CNA_Genes.IS3 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic3 <- cna_summary_ic3 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic3 <- cna_summary_ic3 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic3)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC3 profile
+calculate_similarity <- function(sample_cnv, ic3_profile) {
+  # Merge the sample CNV data with the IC3 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic3_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC3
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic3)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC3", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC3 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```         
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS4' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS4$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS4$Cytoband)
+
+# Step 4: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS4$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS4$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic4 <- CNA_Genes.IS4 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic4 <- cna_summary_ic4 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic4 <- cna_summary_ic4 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic4)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC4 profile
+calculate_similarity <- function(sample_cnv, ic4_profile) {
+  # Merge the sample CNV data with the IC4 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic4_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC4
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic4)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC4", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC4 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS5' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS5$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS5$Cytoband)
+
+# Step 5: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS5$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS5$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic5 <- CNA_Genes.IS5 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic5 <- cna_summary_ic5 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic5 <- cna_summary_ic5 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic5)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC5 profile
+calculate_similarity <- function(sample_cnv, ic5_profile) {
+  # Merge the sample CNV data with the IC5 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic5_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC5
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic5)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC5", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC5 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS6' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS6$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS6$Cytoband)
+
+# Step 6: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS6$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS6$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic6 <- CNA_Genes.IS6 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic6 <- cna_summary_ic6 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic6 <- cna_summary_ic6 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic6)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC6 profile
+calculate_similarity <- function(sample_cnv, ic6_profile) {
+  # Merge the sample CNV data with the IC6 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic6_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC6
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic6)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC6", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC6 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+# Assuming 'CNA_Genes.IS7' is your data frame:
+# Step 1: Extract the chromosome from the cytoband information
+CNA_Genes.IS7$Chromosome <- gsub("([0-9XY]+)[pq].*", "\\1", CNA_Genes.IS7$Cytoband)
+
+# Step 7: Convert Frequency column to numeric (removing percentage sign if any)
+CNA_Genes.IS7$Freq <- as.numeric(gsub("%", "", CNA_Genes.IS7$Freq))
+
+# Step 3: Summarize by Chromosome, counting segments for Amplifications and Deletions separately
+cna_summary_ic7 <- CNA_Genes.IS7 %>%
+  group_by(Chromosome) %>%
+  summarise(
+    Total_Amplifications = sum(Freq[CNA == "AMP"], na.rm = TRUE),
+    Total_Deletions = sum(Freq[CNA == "HOMDEL"], na.rm = TRUE),
+    Count_Amplifications = sum(CNA == "AMP", na.rm = TRUE),  # Count of segments with amplifications
+    Count_Deletions = sum(CNA == "HOMDEL", na.rm = TRUE)  # Count of segments with deletions
+  )
+
+# Step 4: Filter out additional rows not wanted (e.g., Xq, Xp, etc.)
+cna_summary_ic7 <- cna_summary_ic7 %>% filter(!grepl("[pq]", Chromosome))
+
+# Step 5: Normalize the Total_Amplifications and Total_Deletions by their respective counts
+cna_summary_ic7 <- cna_summary_ic7 %>%
+  mutate(
+    Normalized_Amplifications = Total_Amplifications / Count_Amplifications,
+    Normalized_Deletions = Total_Deletions / Count_Deletions
+  )
+
+# Step 6: Display the final normalized summary
+head(cna_summary_ic7)
+
+# Function to calculate similarity score between a sample's CNV profile and the IC7 profile
+calculate_similarity <- function(sample_cnv, ic7_profile) {
+  # Merge the sample CNV data with the IC7 reference profile by Chromosome
+  merged_data <- merge(sample_cnv, ic7_profile, by = "Chromosome", all.x = TRUE)
+  
+  # Replace NA values with 0 to avoid issues in calculation
+  merged_data[is.na(merged_data)] <- 0
+  
+  # Calculate similarity scores
+  amplification_similarity <- sum(merged_data$Gains * merged_data$Normalized_Amplifications)
+  deletion_similarity <- sum(merged_data$Losses * merged_data$Normalized_Deletions)
+  
+  # Return a combined similarity score
+  return(amplification_similarity + deletion_similarity)
+}
+
+# Initialize a vector to store similarity scores
+similarity_scores <- numeric(length(cnv_summary_list))
+
+# Loop through each sample and calculate similarity with IC7
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  similarity_scores[i] <- calculate_similarity(sample_cnv, cna_summary_ic7)
+}
+
+# Store the similarity scores in a data frame for easier analysis
+sample_similarity_df <- data.frame(
+  Sample = names(cnv_summary_list),
+  Similarity_Score = similarity_scores
+)
+
+# View the similarity scores
+head(sample_similarity_df)
+
+# Define a threshold for classification
+# This threshold may require tuning based on your data
+threshold <- mean(similarity_scores) + sd(similarity_scores)
+
+# Classify samples based on the threshold
+sample_similarity_df$Classification <- ifelse(sample_similarity_df$Similarity_Score > threshold, "Match IC7", "Non-Match")
+
+# View the classified samples
+head(sample_similarity_df)
+
+
+# Plot similarity scores and classification
+ggplot(sample_similarity_df, aes(x = Sample, y = Similarity_Score, color = Classification)) +
+  geom_point() +
+  labs(title = "Sample Similarity to IC7 Cluster", x = "Sample", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r}
+
+library(dplyr)
+ensure_dataframe <- function(obj) {
+  # Check if the class of the object includes "Rle"
+  if ("Rle" %in% class(obj)) {
+    return(as.data.frame(as.vector(obj)))
+  } 
+  # If the object is not a data frame, convert it
+  else if (!is.data.frame(obj)) {
+    return(as.data.frame(obj))
+  } 
+  # If the object is already a data frame, return it as is
+  else {
+    return(obj)
+  }
+}
+
+
+
+cluster_profiles <- list(
+  IC1 = cna_summary_ic1,
+  IC2 = cna_summary_ic2,
+  IC3 = cna_summary_ic3,
+  IC4 = cna_summary_ic4,
+  IC5 = cna_summary_ic5,
+  IC6 = cna_summary_ic6,
+  IC7 = cna_summary_ic7,
+  IC8 = cna_summary_ic8,
+  IC9 = cna_summary_ic9,
+  IC10 = cna_summary_ic10
+)
+# Applying the function to  data structures
+cnv_summary_list <- lapply(cnv_summary_list, ensure_dataframe)
+cluster_profiles <- lapply(cluster_profiles, ensure_dataframe)
+
+# Now rerun 
+comparison_results <- data.frame(
+  Sample = character(),
+  Cluster = character(),
+  Similarity_Score = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each sample
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  sample_id <- names(cnv_summary_list)[i]
+  
+  # Loop through each cluster profile
+  for (cluster_name in names(cluster_profiles)) {
+    cluster_profile <- cluster_profiles[[cluster_name]]
+    
+    # Ensure both the sample CNV and cluster profile are data frames
+    sample_cnv <- ensure_dataframe(sample_cnv)
+    cluster_profile <- ensure_dataframe(cluster_profile)
+    
+    # Calculate similarity score between the sample and the cluster profile
+    similarity_score <- calculate_similarity(sample_cnv, cluster_profile)
+    
+    # Store the result in the comparison_results data frame
+    comparison_results <- rbind(comparison_results, data.frame(
+      Sample = sample_id,
+      Cluster = cluster_name,
+      Similarity_Score = similarity_score
+    ))
+  }
+}
+
+# View the comparison results
+head(comparison_results)
+library(dplyr)
+library(ggplot2)
+
+# Identify the best matching cluster for each sample
+best_matches <- comparison_results %>%
+  group_by(Sample) %>%
+  filter(Similarity_Score == max(Similarity_Score)) %>%
+  ungroup()
+
+# View the best matches
+print(best_matches)
+
+# Plot the similarity scores for all samples across all clusters
+ggplot(comparison_results, aes(x = Cluster, y = Similarity_Score, color = Sample)) +
+  geom_point() +
+  labs(title = "Sample Similarity to METABRIC Clusters", x = "Cluster", y = "Similarity Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot the best matching clusters for each sample
+ggplot(best_matches, aes(x = Cluster)) +
+  geom_bar() +
+  labs(title = "Best Matching Clusters for Samples", x = "Cluster", y = "Number of Samples") +
+  theme_minimal()
+
+
+```
+
+```{r}
+library(dplyr)
+library(stats)  
+
+# Custom min-max normalization function
+normalize <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+# Function to calculate Mahalanobis distance
+calculate_mahalanobis_distance <- function(sample_data, cluster_data, cov_matrix) {
+  return(mahalanobis(sample_data, cluster_data, cov_matrix))
+}
+
+# Select one sample and one cluster for comparison
+sample_name <- "GSM774728"  
+cluster_name <- "IC1"       
+
+# Extract the CNV data for the selected sample
+sample_cnv <- cnv_summary_list[[sample_name]] %>%
+  arrange(as.character(Chromosome)) %>%
+  select(Gains, Losses)
+
+# Extract the CNV data for the selected cluster
+cluster_profile <- cluster_profiles[[cluster_name]] %>%
+  arrange(as.character(Chromosome)) %>%
+  select(Normalized_Amplifications, Normalized_Deletions)
+
+# Normalize the sample CNV data
+sample_cnv$Gains <- normalize(sample_cnv$Gains)
+sample_cnv$Losses <- normalize(sample_cnv$Losses)
+
+# Normalize the cluster profile data
+cluster_profile$Normalized_Amplifications <- normalize(cluster_profile$Normalized_Amplifications)
+cluster_profile$Normalized_Deletions <- normalize(cluster_profile$Normalized_Deletions)
+
+# Calculate the covariance matrix of the cluster profile
+cov_matrix <- cov(cluster_profile)
+
+# Calculate Mahalanobis distance between the sample and the cluster profile
+mahalanobis_distance <- calculate_mahalanobis_distance(as.matrix(sample_cnv), colMeans(cluster_profile), cov_matrix)
+
+# Output the Mahalanobis distance
+cat("Mahalanobis Distance between", sample_name, "and", cluster_name, ":", mahalanobis_distance, "\n")
+
+
+
+
+```
+
+```{r}
+library(dplyr)
+library(stats) 
+
+# Function to calculate Mahalanobis distance
+calculate_mahalanobis_distance <- function(sample_data, cluster_data, cov_matrix) {
+  return(mahalanobis(sample_data, cluster_data, cov_matrix))
+}
+
+# Custom min-max normalization function
+normalize <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+# Initialize a data frame to store the results
+all_comparison_results <- data.frame(
+  Sample = character(),
+  Cluster = character(),
+  Mahalanobis_Distance = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each sample
+for (sample_name in names(cnv_summary_list)) {
+  
+  # Extract and normalize the CNV data for the current sample
+  sample_cnv <- cnv_summary_list[[sample_name]] %>%
+    arrange(as.character(Chromosome)) %>%
+    select(Gains, Losses)
+  
+  sample_cnv$Gains <- normalize(sample_cnv$Gains)
+  sample_cnv$Losses <- normalize(sample_cnv$Losses)
+  
+  # Loop through each cluster
+  for (cluster_name in names(cluster_profiles)) {
+    
+    # Extract and normalize the CNV data for the current cluster
+    cluster_profile <- cluster_profiles[[cluster_name]] %>%
+      arrange(as.character(Chromosome)) %>%
+      select(Normalized_Amplifications, Normalized_Deletions)
+    
+    cluster_profile$Normalized_Amplifications <- normalize(cluster_profile$Normalized_Amplifications)
+    cluster_profile$Normalized_Deletions <- normalize(cluster_profile$Normalized_Deletions)
+    
+    # Calculate the covariance matrix of the cluster profile
+    cov_matrix <- cov(cluster_profile)
+    
+    # Calculate Mahalanobis distance between the sample and the cluster profile
+    mahalanobis_distance <- calculate_mahalanobis_distance(as.matrix(sample_cnv), colMeans(cluster_profile), cov_matrix)
+    
+    # Store the result in the results data frame
+    all_comparison_results <- rbind(all_comparison_results, data.frame(
+      Sample = sample_name,
+      Cluster = cluster_name,
+      Mahalanobis_Distance = mahalanobis_distance
+    ))
+  }
+}
+
+# Identify the best matching cluster for each sample (smallest Mahalanobis distance)
+best_matches <- all_comparison_results %>%
+  group_by(Sample) %>%
+  slice_min(Mahalanobis_Distance) %>%
+  ungroup()
+
+# View the best matches
+print(best_matches)
+
+# plot the similarity scores for all samples across all clusters
+ggplot(all_comparison_results, aes(x = Cluster, y = Mahalanobis_Distance, color = Sample)) +
+  geom_point() +
+  labs(title = "Sample Similarity to METABRIC Clusters (Mahalanobis Distance)", x = "Cluster", y = "Mahalanobis Distance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot the best matching clusters for each sample
+ggplot(best_matches, aes(x = Cluster)) +
+  geom_bar() +
+  labs(title = "Best Matching Clusters for Samples", x = "Cluster", y = "Number of Samples") +
+  theme_minimal()
+
+```
+
+```{r}
+library(dplyr)
+library(stats)  
+
+# Function to calculate Mahalanobis distance
+calculate_mahalanobis_distance <- function(sample_data, cluster_data, cov_matrix) {
+  return(mahalanobis(sample_data, cluster_data, cov_matrix))
+}
+
+# Custom min-max normalization function
+normalize <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+# Initialize a data frame to store the results
+all_comparison_results <- data.frame(
+  Sample = character(),
+  Cluster = character(),
+  Mahalanobis_Distance = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each sample
+for (sample_name in names(cnv_summary_list)) {
+  
+  # Extract and normalize the CNV data for the current sample
+  sample_cnv <- cnv_summary_list[[sample_name]] %>%
+    arrange(as.character(Chromosome)) %>%
+    select(Gains, Losses)
+  
+  sample_cnv$Gains <- normalize(sample_cnv$Gains)
+  sample_cnv$Losses <- normalize(sample_cnv$Losses)
+  
+  # Loop through each cluster
+  for (cluster_name in names(cluster_profiles)) {
+    
+    # Extract and normalize the CNV data for the current cluster
+    cluster_profile <- cluster_profiles[[cluster_name]] %>%
+      arrange(as.character(Chromosome)) %>%
+      select(Normalized_Amplifications, Normalized_Deletions)
+    
+    cluster_profile$Normalized_Amplifications <- normalize(cluster_profile$Normalized_Amplifications)
+    cluster_profile$Normalized_Deletions <- normalize(cluster_profile$Normalized_Deletions)
+    
+    # Calculate the covariance matrix of the cluster profile
+    cov_matrix <- cov(cluster_profile)
+    
+    # Calculate Mahalanobis distance between the sample and the cluster profile
+    mahalanobis_distance <- calculate_mahalanobis_distance(as.matrix(sample_cnv), colMeans(cluster_profile), cov_matrix)
+    
+    # Store the result in the results data frame
+    all_comparison_results <- rbind(all_comparison_results, data.frame(
+      Sample = sample_name,
+      Cluster = cluster_name,
+      Mahalanobis_Distance = mahalanobis_distance
+    ))
+  }
+}
+
+# Identify the best matching cluster for each sample (smallest Mahalanobis distance)
+best_matches <- all_comparison_results %>%
+  group_by(Sample) %>%
+  slice_min(Mahalanobis_Distance) %>%
+  ungroup()
+
+# View the best matches
+print(best_matches)
+
+# plot the similarity scores for all samples across all clusters
+ggplot(all_comparison_results, aes(x = Cluster, y = Mahalanobis_Distance, color = Sample)) +
+  geom_point() +
+  labs(title = "Sample Similarity to METABRIC Clusters (Mahalanobis Distance)", x = "Cluster", y = "Mahalanobis Distance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot the best matching clusters for each sample
+ggplot(best_matches, aes(x = Cluster)) +
+  geom_bar() +
+  labs(title = "Best Matching Clusters for Samples", x = "Cluster", y = "Number of Samples") +
+  theme_minimal()
+
+```
+
+```{r}
+library(dplyr)
+
+# Ensure all_comparison_results is a data frame
+all_comparison_results <- as.data.frame(all_comparison_results)
+
+# Sort the Mahalanobis distances within each sample
+all_comparison_results <- all_comparison_results %>%
+  arrange(Sample, Mahalanobis_Distance)
+
+# Loop through each sample
+unique_samples <- unique(all_comparison_results$Sample)
+sample_test_results <- list()
+
+for (sample_name in unique_samples) {
+  # Filter the data for the current sample
+  sample_data <- all_comparison_results %>% filter(Sample == sample_name)
+  
+  # Use the first match as the baseline
+  baseline_distance <- sample_data$Mahalanobis_Distance[1]
+  
+  # Calculate the difference between the baseline and each of the other matches
+  differences <- baseline_distance - sample_data$Mahalanobis_Distance[2:10]
+  
+  # Perform a paired t-test (comparing baseline to other matches)
+  t_test_result <- t.test(differences, alternative = "greater")
+  
+  # Store the result with the sample name
+  sample_test_results[[sample_name]] <- t_test_result
+}
+
+# View the t-test results for each sample
+sample_test_results
+
+wilcox_test_result <- wilcox.test(differences, alternative = "greater")
+sample_test_results[[sample_name]] <- wilcox_test_result
+```
+
+```{r}
+
+
+library(dplyr)
+library(ggplot2)
+
+# Function to ensure data is in dataframe format
+ensure_dataframe <- function(obj) {
+  if ("Rle" %in% class(obj)) {
+    return(as.data.frame(as.vector(obj)))
+  } else if (!is.data.frame(obj)) {
+    return(as.data.frame(obj))
+  } else {
+    return(obj)
+  }
+}
+
+
+# Ensure the CNV summary lists and cluster profiles are in dataframe format
+cnv_summary_list <- lapply(cnv_summary_list, ensure_dataframe)
+cluster_profiles <- lapply(cluster_profiles, ensure_dataframe)
+
+# Initialize a data frame to store comparison results
+comparison_results <- data.frame(
+  Sample = character(),
+  Cluster = character(),
+  Similarity_Score = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+# Aggregating sample CNV data by chromosome
+aggregate_sample_cnv <- function(df) {
+  df %>%
+    group_by(Chromosome) %>%
+    summarize(
+      Gains = sum(Gains, na.rm = TRUE),
+      Losses = sum(Losses, na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+# Apply aggregation to each sample in the cnv_summary_list
+cnv_summary_list <- lapply(cnv_summary_list, aggregate_sample_cnv)
+
+# Function to check for missing chromosomes and add them with zero values
+ensure_all_chromosomes <- function(df, reference_chromosomes) {
+  missing_chromosomes <- setdiff(reference_chromosomes, df$Chromosome)
+  
+  if (length(missing_chromosomes) > 0) {
+    missing_data <- data.frame(
+      Chromosome = missing_chromosomes,
+      Gains = 0,
+      Losses = 0
+    )
+    df <- rbind(df, missing_data)
+  }
+  
+  return(df[order(df$Chromosome), ])
+}
+
+# Get a reference list of chromosomes from cluster_profile
+reference_chromosomes <- cluster_profiles[[1]]$Chromosome
+
+# Apply the function to each sample CNV summary
+cnv_summary_list <- lapply(cnv_summary_list, ensure_all_chromosomes, reference_chromosomes)
+
+# Check the dimensions again to ensure they match
+dim(cnv_summary_list[[1]])  # Should now be 23 x 3, matching cluster_profile
+
+
+# Adjusted similarity function to compare the appropriate columns
+calculate_similarity <- function(df1, df2) {
+  # Ensure the data frames are ordered the same
+  df1 <- df1[order(df1$Chromosome), ]
+  df2 <- df2[order(df2$Chromosome), ]
+  
+  # Select the columns to compare
+  df1_values <- cbind(df1$Gains, df1$Losses)
+  df2_values <- cbind(df2$Normalized_Amplifications, df2$Normalized_Deletions)
+  
+  # Calculate Euclidean distance
+  distance <- sqrt(sum((df1_values - df2_values)^2))
+  return(distance)
+}
+
+# Re-run the loop to calculate similarity scores
+comparison_results <- data.frame(
+  Sample = character(),
+  Cluster = character(),
+  Similarity_Score = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(cnv_summary_list)) {
+  sample_cnv <- cnv_summary_list[[i]]
+  sample_id <- names(cnv_summary_list)[i]
+  
+  for (cluster_name in names(cluster_profiles)) {
+    cluster_profile <- cluster_profiles[[cluster_name]]
+    
+    # Calculate similarity score (Euclidean distance) between the sample and the cluster profile
+    similarity_score <- calculate_similarity(sample_cnv, cluster_profile)
+    
+    # Store the result in the comparison_results data frame
+    comparison_results <- rbind(comparison_results, data.frame(
+      Sample = sample_id,
+      Cluster = cluster_name,
+      Similarity_Score = similarity_score
+    ))
+  }
+}
+
+# View the comparison results
+head(comparison_results)
+
+
+# Add a new column to identify the minimum similarity score for each sample
+best_matches <- comparison_results %>%
+  group_by(Sample) %>%
+  mutate(Min_Similarity_Score = min(Similarity_Score)) %>%
+  ungroup()
+
+# Filter the rows where the Similarity_Score is equal to the Min_Similarity_Score
+best_matches <- best_matches %>%
+  filter(Similarity_Score == Min_Similarity_Score) %>%
+  select(-Min_Similarity_Score)  # Optionally remove the helper column
+
+# View the best matches
+print(best_matches)
+
+
+# Plot the similarity scores for all samples across all clusters
+ggplot(comparison_results, aes(x = Cluster, y = Similarity_Score, color = Sample)) +
+  geom_point() +
+  labs(title = "Sample Similarity to METABRIC Clusters", x = "Cluster", y = "Euclidean Distance (Similarity Score)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot the best matching clusters for each sample
+ggplot(best_matches, aes(x = Cluster)) +
+  geom_bar() +
+  labs(title = "Best Matching Clusters for Samples", x = "Cluster", y = "Number of Samples") +
+  theme_minimal()
+
+
+
+```
